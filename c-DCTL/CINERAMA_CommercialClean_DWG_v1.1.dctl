@@ -1,0 +1,160 @@
+// --------------------------------------------------
+// CINERAMA Commercial Clean - DCTL for DaVinci Resolve
+// Version: v1.1  (Transform() entrypoint)
+// Target Space: DaVinci Wide Gamut / DaVinci Intermediate
+// Author: CINERAMA Media Production - Hussain Dashti
+// --------------------------------------------------
+
+// ------------------------- UI -------------------------
+DEFINE_UI_PARAMS(p_Exposure,      "Exposure (stops)",    DCTLUI_SLIDER_FLOAT, 0.0,  -3.0, 3.0, 0.01)
+DEFINE_UI_PARAMS(p_Black,         "Black Level",         DCTLUI_SLIDER_FLOAT, 0.0, -0.05, 0.05, 0.001)
+DEFINE_UI_PARAMS(p_Contrast,      "Contrast",            DCTLUI_SLIDER_FLOAT, 1.15, 0.50, 2.00, 0.01)
+DEFINE_UI_PARAMS(p_Pivot,         "Contrast Pivot",      DCTLUI_SLIDER_FLOAT, 0.40, 0.10, 0.90, 0.01)
+DEFINE_UI_PARAMS(p_Sat,           "Saturation",          DCTLUI_SLIDER_FLOAT, 1.05, 0.30, 2.00, 0.01)
+DEFINE_UI_PARAMS(p_Vibrance,      "Vibrance",            DCTLUI_SLIDER_FLOAT, 0.20,-1.00, 1.00, 0.01)
+DEFINE_UI_PARAMS(p_SkinSat,       "Skin Sat Boost",      DCTLUI_SLIDER_FLOAT, 0.10,-1.00, 1.00, 0.01)
+DEFINE_UI_PARAMS(p_SkinHueShift,  "Skin Hue Shift",      DCTLUI_SLIDER_FLOAT, 0.00,-0.05, 0.05, 0.001)
+DEFINE_UI_PARAMS(p_ShadowClean,   "Shadow Clean",        DCTLUI_SLIDER_FLOAT, 0.15, 0.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(p_HLRoll,        "Highlight Rolloff",   DCTLUI_SLIDER_FLOAT, 0.25, 0.0, 1.0, 0.01)
+
+// ------------------------ Helpers ------------------------
+__DEVICE__ float3 make3(float a, float b, float c){ return make_float3(a,b,c); }
+
+__DEVICE__ float sat1(float x){ return _saturatef(x); }
+
+__DEVICE__ float luminance(float3 c){
+    return c.x*0.2126f + c.y*0.7152f + c.z*0.0722f;
+}
+
+__DEVICE__ float3 contrast(float3 c,float ct,float pv){
+    return make3((c.x-pv)*ct+pv,(c.y-pv)*ct+pv,(c.z-pv)*ct+pv);
+}
+
+__DEVICE__ float3 saturation(float3 c,float s){
+    float l=luminance(c);
+    float3 g = make3(l,l,l);
+    return g + (c-g)*s;
+}
+
+// Vibrance
+__DEVICE__ float3 vibrance_apply(float3 c,float v){
+    float l = luminance(c);
+    float3 g = make3(l,l,l);
+    float3 d = c-g;
+    float sat = _sqrtf(d.x*d.x+d.y*d.y+d.z*d.z);
+    float f = 1.0f + v*(1.0f - sat*2.0f)*(1.0f - _fabs(l-0.5f)*2.0f);
+    return g + d*f;
+}
+
+// Shadow clean
+__DEVICE__ float3 shadow_clean(float3 c,float amt){
+    float thr = 0.08f;
+    float p   = 1.0f + amt*2.0f;
+    for(int i=0;i<3;i++){
+        float x = (&c.x)[i];
+        if(x>0.0f){
+            float t = x/thr;
+            t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+            float s = thr*_powf(t,p);
+            (&c.x)[i] = x + (s-x)*amt;
+        }else{
+            (&c.x)[i] = 0.0f;
+        }
+    }
+    return c;
+}
+
+// Highlight roll-off
+__DEVICE__ float3 hl_roll(float3 c,float s){
+    if(s<=0.0f) return c;
+    float l = luminance(c);
+    float t = sat1((l-0.7f)/0.4f);
+    float knee = 1.0f;
+    float3 o = c;
+    for(int i=0;i<3;i++){
+        float x = (&c.x)[i];
+        if(x>knee){
+            float r = knee + (x-knee)/(1.0f+(x-knee));
+            (&o.x)[i] = x + (r-x)*(t*s);
+        }
+    }
+    return o;
+}
+
+// Skin tweaks (HSV-ish)
+__DEVICE__ float3 skin_fx(float3 c,float ss,float sh){
+    float r = sat1(c.x);
+    float g = sat1(c.y);
+    float b = sat1(c.z);
+
+    float maxc = r>g ? (r>b?r:b) : (g>b?g:b);
+    float minc = r<g ? (r<b?r:b) : (g<b?g:b);
+    float d = maxc-minc;
+    float h,s,v;
+    v = maxc;
+    s = (maxc==0.0f)?0.0f:(d/maxc);
+
+    if(d==0.0f){
+        h = 0.0f;
+    }else if(maxc==r){
+        h = (g-b)/d;
+    }else if(maxc==g){
+        h = 2.0f + (b-r)/d;
+    }else{
+        h = 4.0f + (r-g)/d;
+    }
+    h /= 6.0f;
+    if(h<0.0f) h += 1.0f;
+
+    // skin hue range ~ 20°-50°
+    float hmin = 0.05f;
+    float hmax = 0.16f;
+    float mid  = (hmin+hmax)*0.5f;
+    float w    = (hmax-hmin)*0.7f;
+
+    float dist = _fabs(h-mid);
+    dist = dist < (1.0f-dist) ? dist : (1.0f-dist);
+    float mask = 1.0f - sat1(dist/w);
+    mask *= s*(1.0f-_fabs(s-0.5f)*1.3f);
+    if(mask<=0.0f) return c;
+
+    s = s*(1.0f+ss*mask);
+    h = h+sh*mask;
+    if(h<0.0f) h+=1.0f;
+    if(h>1.0f) h-=1.0f;
+
+    float hf = h*6.0f;
+    float i  = _floorf(hf);
+    float f  = hf-i;
+    float p  = v*(1.0f-s);
+    float q  = v*(1.0f-s*f);
+    float t  = v*(1.0f-s*(1.0f-f));
+
+    float3 out;
+         if(i==0.0f) out = make3(v,t,p);
+    else if(i==1.0f) out = make3(q,v,p);
+    else if(i==2.0f) out = make3(p,v,t);
+    else if(i==3.0f) out = make3(p,q,v);
+    else if(i==4.0f) out = make3(t,p,v);
+    else             out = make3(v,p,q);
+
+    return c + (out-c)*mask;
+}
+
+// ---------------------- MAIN TRANSFORM ----------------------
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y,
+                            float p_R, float p_G, float p_B)
+{
+    float3 c = make_float3(p_R, p_G, p_B);
+
+    c *= _exp2f(p_Exposure);
+    c += make3(p_Black,p_Black,p_Black);
+    c = contrast(c,p_Contrast,p_Pivot);
+    c = shadow_clean(c,p_ShadowClean);
+    c = saturation(c,p_Sat);
+    c = vibrance_apply(c,p_Vibrance);
+    c = skin_fx(c,p_SkinSat,p_SkinHueShift);
+    c = hl_roll(c,p_HLRoll);
+
+    return c;
+}
