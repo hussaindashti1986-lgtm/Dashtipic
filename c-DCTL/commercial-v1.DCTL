@@ -1,0 +1,300 @@
+// --------------------------------------------------
+// CINERAMA Commercial Clean - DaVinci Wide Gamut / Intermediate
+// Version: v1.0
+// Author: CINERAMA Media Production (Hussain Dashti)
+// Description:
+//   Commercial "clean" look for ads:
+//   - Clean contrast
+//   - Controlled saturation & vibrance
+//   - Subtle skin enhancement
+//   - Shadow cleaning
+//   - Soft highlight rolloff
+//   Target space: DaVinci Wide Gamut / DaVinci Intermediate (RCM)
+// --------------------------------------------------
+
+// -------------------------
+// UI Controls
+// -------------------------
+DEFINE_UI_PARAMS(p_Exposure,      Exposure (stops),   DCTLUI_SLIDER_FLOAT, 0.0,  -3.0,  3.0,  0.01)
+DEFINE_UI_PARAMS(p_Black,         Black Level,        DCTLUI_SLIDER_FLOAT, 0.0,  -0.05, 0.05, 0.001)
+DEFINE_UI_PARAMS(p_Contrast,      Contrast,           DCTLUI_SLIDER_FLOAT, 1.15, 0.50,  2.00, 0.01)
+DEFINE_UI_PARAMS(p_Pivot,         Contrast Pivot,     DCTLUI_SLIDER_FLOAT, 0.40, 0.10,  0.90, 0.01)
+DEFINE_UI_PARAMS(p_Sat,           Saturation,         DCTLUI_SLIDER_FLOAT, 1.05, 0.30,  2.00, 0.01)
+DEFINE_UI_PARAMS(p_Vibrance,      Vibrance,           DCTLUI_SLIDER_FLOAT, 0.20, -1.00, 1.00, 0.01)
+DEFINE_UI_PARAMS(p_SkinSat,       Skin Sat Boost,     DCTLUI_SLIDER_FLOAT, 0.10, -1.00, 1.00, 0.01)
+DEFINE_UI_PARAMS(p_SkinHueShift,  Skin Hue Shift,     DCTLUI_SLIDER_FLOAT, 0.00, -0.05, 0.05, 0.001)
+DEFINE_UI_PARAMS(p_ShadowClean,   Shadow Clean,       DCTLUI_SLIDER_FLOAT, 0.15, 0.00,  1.00, 0.01)
+DEFINE_UI_PARAMS(p_HLRoll,        Highlight Rolloff,  DCTLUI_SLIDER_FLOAT, 0.25, 0.00,  1.00, 0.01)
+
+// -------------------------
+// Helpers
+// -------------------------
+__DEVICE__ float saturate1(float x)
+{
+    return fminf(fmaxf(x, 0.0f), 1.0f);
+}
+
+__DEVICE__ float3 make_vec3(float x, float y, float z)
+{
+    return make_float3(x, y, z);
+}
+
+__DEVICE__ float3 lerp3(float3 a, float3 b, float t)
+{
+    return a + (b - a) * t;
+}
+
+__DEVICE__ float luminance709(float3 c)
+{
+    return c.x * 0.2126f + c.y * 0.7152f + c.z * 0.0722f;
+}
+
+__DEVICE__ float3 apply_contrast(float3 rgb, float contrast, float pivot)
+{
+    rgb.x = (rgb.x - pivot) * contrast + pivot;
+    rgb.y = (rgb.y - pivot) * contrast + pivot;
+    rgb.z = (rgb.z - pivot) * contrast + pivot;
+    return rgb;
+}
+
+__DEVICE__ float3 apply_saturation(float3 rgb, float sat)
+{
+    float l = luminance709(rgb);
+    float3 gray = make_vec3(l, l, l);
+    return gray + (rgb - gray) * sat;
+}
+
+// Vibrance: يزيد تشبع المناطق الباهتة أكثر من المشبعة
+__DEVICE__ float3 apply_vibrance(float3 rgb, float vibrance)
+{
+    float l = luminance709(rgb);
+    float3 gray = make_vec3(l, l, l);
+    float3 diff = rgb - gray;
+    float satAmount = sqrtf(diff.x * diff.x + diff.y * diff.y + diff.z * diff.z);
+
+    float satNorm = saturate1(satAmount / 0.5f); // تقريب
+    float vibFactor = 1.0f + vibrance * (1.0f - satNorm) * (1.0f - fabsf(l - 0.5f) * 1.5f);
+
+    diff *= vibFactor;
+    return gray + diff;
+}
+
+// Shadow cleaning / crushing noise
+__DEVICE__ float3 apply_shadow_clean(float3 rgb, float amount)
+{
+    if (amount <= 0.0f) return rgb;
+
+    float threshold = 0.08f; // حدود الشادو
+    float power = 1.0f + amount * 2.0f;
+
+    for (int i = 0; i < 3; ++i)
+    {
+        float x = (&rgb.x)[i];
+        if (x > 0.0f)
+        {
+            float t = fminf(x / threshold, 1.0f);
+            float shaped = threshold * powf(t, power);
+            float orig = x;
+            float mixed = orig + (shaped - orig) * amount;
+            (&rgb.x)[i] = mixed;
+        }
+        else
+        {
+            (&rgb.x)[i] = 0.0f;
+        }
+    }
+    return rgb;
+}
+
+// Soft highlight clip
+__DEVICE__ float softclip(float x, float knee)
+{
+    if (x <= knee) return x;
+    float t = x - knee;
+    return knee + t / (1.0f + t);
+}
+
+__DEVICE__ float3 apply_highlight_rolloff(float3 rgb, float strength)
+{
+    if (strength <= 0.0f)
+        return rgb;
+
+    float l = luminance709(rgb);
+    float t = saturate1((l - 0.7f) / 0.4f); // يبدأ من mid-high
+
+    float knee = 1.0f;
+    float3 clipped;
+    clipped.x = softclip(rgb.x, knee);
+    clipped.y = softclip(rgb.y, knee);
+    clipped.z = softclip(rgb.z, knee);
+
+    float k = t * strength;
+    rgb = lerp3(rgb, clipped, k);
+
+    return rgb;
+}
+
+// -------------------------
+// RGB <-> HSV (للسكن)
+// -------------------------
+__DEVICE__ void rgb_to_hsv(float3 rgb, float *h, float *s, float *v)
+{
+    float r = saturate1(rgb.x);
+    float g = saturate1(rgb.y);
+    float b = saturate1(rgb.z);
+
+    float maxc = fmaxf(r, fmaxf(g, b));
+    float minc = fminf(r, fminf(g, b));
+    float delta = maxc - minc;
+
+    *v = maxc;
+
+    if (maxc > 0.0f)
+        *s = delta / maxc;
+    else
+    {
+        *s = 0.0f;
+        *h = 0.0f;
+        return;
+    }
+
+    float hTemp;
+    if (delta == 0.0f)
+    {
+        hTemp = 0.0f;
+    }
+    else if (maxc == r)
+    {
+        hTemp = (g - b) / delta;
+    }
+    else if (maxc == g)
+    {
+        hTemp = 2.0f + (b - r) / delta;
+    }
+    else
+    {
+        hTemp = 4.0f + (r - g) / delta;
+    }
+
+    hTemp /= 6.0f;
+    if (hTemp < 0.0f) hTemp += 1.0f;
+    *h = hTemp;
+}
+
+__DEVICE__ float3 hsv_to_rgb(float h, float s, float v)
+{
+    float r, g, b;
+
+    if (s <= 0.0f)
+    {
+        r = g = b = v;
+    }
+    else
+    {
+        h = (h - floorf(h)); // 0..1
+        float hf = h * 6.0f;
+        int i = (int)floorf(hf);
+        float f = hf - (float)i;
+        float p = v * (1.0f - s);
+        float q = v * (1.0f - s * f);
+        float t = v * (1.0f - s * (1.0f - f));
+
+        if (i == 0)      { r = v; g = t; b = p; }
+        else if (i == 1) { r = q; g = v; b = p; }
+        else if (i == 2) { r = p; g = v; b = t; }
+        else if (i == 3) { r = p; g = q; b = v; }
+        else if (i == 4) { r = t; g = p; b = v; }
+        else             { r = v; g = p; b = q; }
+    }
+
+    return make_vec3(r, g, b);
+}
+
+// Skin control (رينج سكِن عام)
+__DEVICE__ float3 apply_skin_controls(float3 rgb, float skinSatBoost, float skinHueShift)
+{
+    if (skinSatBoost == 0.0f && skinHueShift == 0.0f)
+        return rgb;
+
+    float3 rgbClamped = make_vec3(saturate1(rgb.x), saturate1(rgb.y), saturate1(rgb.z));
+
+    float h, s, v;
+    rgb_to_hsv(rgbClamped, &h, &s, &v);
+
+    // رينج تقريبي للسكن (حوالي 20°–50°)
+    float hMin = 0.05f;
+    float hMax = 0.16f;
+    float hCenter = (hMin + hMax) * 0.5f;
+    float width = (hMax - hMin) * 0.7f;
+
+    float dist = fabsf(h - hCenter);
+    dist = fminf(dist, 1.0f - dist); // wrap
+    float mask = 1.0f - saturate1(dist / width);
+
+    // نخفف التأثير حسب السات
+    float satWeight = s * (1.0f - fabsf(s - 0.5f) * 1.3f);
+    mask *= satWeight;
+
+    if (mask <= 0.0f)
+        return rgb;
+
+    float sNew = s * (1.0f + skinSatBoost * mask);
+
+    float hNew = h + skinHueShift * mask;
+    if (hNew < 0.0f) hNew += 1.0f;
+    if (hNew > 1.0f) hNew -= 1.0f;
+
+    float3 rgbSkin = hsv_to_rgb(hNew, sNew, v);
+
+    float3 outRgb = lerp3(rgb, rgbSkin, saturate1(mask));
+
+    return outRgb;
+}
+
+// -------------------------
+// Main Transform
+// -------------------------
+__DEVICE__ float3 transform(
+    int   p_Width,
+    int   p_Height,
+    int   p_X,
+    int   p_Y,
+    float p_R,
+    float p_G,
+    float p_B)
+{
+    // يعمل في DaVinci Wide Gamut / Intermediate (RCM)
+    float3 rgb = make_vec3(p_R, p_G, p_B);
+
+    // 1) Exposure بالستوب
+    float gain = _exp2f(p_Exposure);
+    rgb *= gain;
+
+    // 2) Black level
+    rgb += make_vec3(p_Black, p_Black, p_Black);
+
+    // 3) Contrast + Pivot
+    rgb = apply_contrast(rgb, p_Contrast, p_Pivot);
+
+    // 4) Shadow clean
+    rgb = apply_shadow_clean(rgb, p_ShadowClean);
+
+    // 5) Saturation العام
+    rgb = apply_saturation(rgb, p_Sat);
+
+    // 6) Vibrance
+    rgb = apply_vibrance(rgb, p_Vibrance);
+
+    // 7) Skin controls
+    rgb = apply_skin_controls(rgb, p_SkinSat, p_SkinHueShift);
+
+    // 8) Highlight rolloff
+    rgb = apply_highlight_rolloff(rgb, p_HLRoll);
+
+    // 9) لا نكلب 0–1 عشان RCM, بس نمنع السالب
+    rgb.x = fmaxf(rgb.x, 0.0f);
+    rgb.y = fmaxf(rgb.y, 0.0f);
+    rgb.z = fmaxf(rgb.z, 0.0f);
+
+    return rgb;
+}
